@@ -1,6 +1,9 @@
+import argparse
 import asyncio
 import json
 import os
+import time
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -185,20 +188,26 @@ Return ONLY valid JSON with no preamble:
 
 
 class RateLimiter:
-    def __init__(self, rpm: int, max_concurrent: int = 5) -> None:
-        self.interval = 60.0 / float(rpm)
+    """
+    Simple rate limiter that spaces requests without
+    blocking other coroutines more than necessary.
+    """
+
+    def __init__(self, rpm: int, max_concurrent: int = 10) -> None:
+        self.min_interval = 60.0 / float(rpm)
         self._semaphore = asyncio.Semaphore(max_concurrent)
-        self._last_call: float = 0.0
-        self._lock = asyncio.Lock()
+        self._last_request_time: float = 0.0
+        self._interval_lock = asyncio.Lock()
 
     async def acquire(self) -> None:
         await self._semaphore.acquire()
-        async with self._lock:
+        async with self._interval_lock:
             now = asyncio.get_event_loop().time()
-            wait_for = self.interval - (now - self._last_call)
-            if wait_for > 0:
-                await asyncio.sleep(wait_for)
-            self._last_call = asyncio.get_event_loop().time()
+            elapsed = now - self._last_request_time
+            sleep_for = self.min_interval - elapsed
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
+            self._last_request_time = asyncio.get_event_loop().time()
 
     def release(self) -> None:
         self._semaphore.release()
@@ -209,28 +218,52 @@ async def call_groq_json(
     model: str,
     prompt: str,
     rate_limiter: RateLimiter,
+    max_retries: int = 3,
 ) -> Dict[str, Any]:
-    await rate_limiter.acquire()
-    try:
-        resp = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.8,
-                max_tokens=800,
-            ),
-        )
-    finally:
-        rate_limiter.release()
+    for attempt in range(max_retries + 1):
+        await rate_limiter.acquire()
+        try:
+            resp = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.8,
+                    max_tokens=800,
+                ),
+            )
+            content = resp.choices[0].message.content or ""
 
-    content = resp.choices[0].message.content
-    if isinstance(content, list):
-        text = "".join(part.get("text", "") for part in content)
-    else:
-        text = content or ""
+            start = content.find("{")
+            end = content.rfind("}") + 1
+            if start == -1 or end <= start:
+                raise ValueError(f"No JSON in response: {content[:200]}")
 
-    return json.loads(text)
+            parsed = json.loads(content[start:end])
+
+            if not parsed.get("text", "").strip():
+                raise ValueError("Empty text field in response")
+
+            return parsed
+
+        except json.JSONDecodeError:
+            if attempt == max_retries:
+                raise
+            await asyncio.sleep(2**attempt)
+        except Exception as e:
+            error_str = str(e).lower()
+            if "rate_limit" in error_str or "429" in error_str:
+                wait = 60 * (attempt + 1)
+                print(
+                    f"\nRate limited (attempt {attempt + 1}), waiting {wait}s..."
+                )
+                await asyncio.sleep(wait)
+            elif attempt == max_retries:
+                raise
+            else:
+                await asyncio.sleep(2**attempt)
+        finally:
+            rate_limiter.release()
 
 
 def load_existing_indices(path: Path) -> Dict[str, int]:
@@ -248,73 +281,19 @@ def load_existing_indices(path: Path) -> Dict[str, int]:
     return counts
 
 
-async def generate_all(config: GenerationConfig) -> None:
+async def generate_all(config: GenerationConfig, test_mode: bool = False) -> None:
     api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
         raise RuntimeError("GROQ_API_KEY environment variable must be set.")
 
     client = Groq(api_key=api_key)
-    rate_limiter = RateLimiter(rpm=config.rate_limit_rpm, max_concurrent=5)
+    rate_limiter = RateLimiter(rpm=config.rate_limit_rpm, max_concurrent=10)
 
     existing = load_existing_indices(config.output_path)
     total_target_easy = 0
     total_target_hard = 0
 
-    tasks: List[asyncio.Task] = []
-    progress_bar = tqdm(total=0, desc="Generating SDGX", unit="examples")
-    token_count = 0
-
-    async def schedule_example(kind: str, key: str, make_prompt, meta: Dict[str, Any]) -> None:
-        nonlocal token_count
-        retries = 0
-        while retries <= config.max_retries:
-            try:
-                prompt = make_prompt()
-                result = await call_groq_json(client, config.primary_model, prompt, rate_limiter)
-                meta_out = {**meta, **result}
-                with config.output_path.open("a", encoding="utf-8") as out_f:
-                    out_f.write(json.dumps(meta_out, ensure_ascii=False) + "\n")
-                approx_tokens = len(meta_out.get("text", "").split())
-                token_count += approx_tokens
-                progress_bar.update(1)
-                progress_bar.set_postfix_str(
-                    f"{kind} {key} | tokens~{token_count}"
-                )
-                return
-            except json.JSONDecodeError:
-                retries += 1
-                if retries > config.max_retries:
-                    with config.failed_path.open("a", encoding="utf-8") as ff:
-                        ff.write(
-                            json.dumps(
-                                {
-                                    "kind": kind,
-                                    "key": key,
-                                    "error": "json_decode_error",
-                                    "meta": meta,
-                                },
-                                ensure_ascii=False,
-                            )
-                            + "\n"
-                        )
-                    return
-            except Exception as e:
-                retries += 1
-                if retries > config.max_retries:
-                    with config.failed_path.open("a", encoding="utf-8") as ff:
-                        ff.write(
-                            json.dumps(
-                                {
-                                    "kind": kind,
-                                    "key": key,
-                                    "error": repr(e),
-                                    "meta": meta,
-                                },
-                                ensure_ascii=False,
-                            )
-                            + "\n"
-                        )
-                    return
+    plan: List[Tuple[str, Dict[str, Any], str]] = []
 
     # Easy examples per SDG
     for sdg in range(1, 18):
@@ -332,16 +311,7 @@ async def generate_all(config: GenerationConfig) -> None:
         remaining = max(0, target - done)
 
         for _ in range(remaining):
-            tasks.append(
-                asyncio.create_task(
-                    schedule_example(
-                        "easy",
-                        key,
-                        lambda s=sdg: build_easy_prompt(s),
-                        {"primary_sdg": sdg, "type": "easy"},
-                    )
-                )
-            )
+            plan.append(("easy", {"primary_sdg": sdg, "type": "easy"}, key))
 
     # Hard examples for confused pairs
     for n, m in config.confused_pairs:
@@ -354,44 +324,142 @@ async def generate_all(config: GenerationConfig) -> None:
         remaining = max(0, target - done)
 
         for _ in range(remaining):
-            tasks.append(
-                asyncio.create_task(
-                    schedule_example(
+            plan.append(
+                ("hard", {"sdgs": [n, m], "type": "hard", "pair": pair_key}, key)
+            )
+
+    if test_mode:
+        plan = []
+        for _ in range(3):
+            plan.append(("easy", {"primary_sdg": 1, "type": "easy"}, "easy::1"))
+        if config.confused_pairs:
+            n, m = config.confused_pairs[0]
+            pair_key = f"{n}_{m}"
+            for _ in range(2):
+                plan.append(
+                    (
                         "hard",
-                        key,
-                        lambda a=n, b=m: build_hard_prompt(a, b),
                         {"sdgs": [n, m], "type": "hard", "pair": pair_key},
+                        f"hard::{pair_key}",
                     )
                 )
-            )
 
     total_target = total_target_easy + total_target_hard
     already_done = sum(existing.values())
-    remaining_total = max(0, total_target - already_done)
-    progress_bar.total = remaining_total
-    progress_bar.refresh()
+    remaining_total = len(plan)
 
     print(
         f"Planned generation: easy={total_target_easy}, hard={total_target_hard}, "
         f"total={total_target} (already in file: {already_done}, remaining: {remaining_total})"
     )
 
-    if not tasks:
+    if remaining_total == 0:
         print("No remaining examples to generate.")
         return
 
-    await asyncio.gather(*tasks)
-    progress_bar.close()
-    print(f"Generation complete. Approximate token count: {token_count}")
+    est_minutes = remaining_total / float(config.rate_limit_rpm)
+    print(
+        f"Generating {remaining_total} examples...\n"
+        f"Est. time at {config.rate_limit_rpm} RPM with 10 concurrent: "
+        f"~{est_minutes:.1f} minutes (ideal, ignoring retries)"
+    )
+
+    file_lock = asyncio.Lock()
+    stats = defaultdict(int)
+    token_count = 0
+    processed = 0
+    start_time = time.time()
+
+    async def process_one(kind: str, meta: Dict[str, Any], key: str) -> None:
+        nonlocal token_count, processed
+        try:
+            prompt = (
+                build_easy_prompt(meta["primary_sdg"])
+                if kind == "easy"
+                else build_hard_prompt(meta["sdgs"][0], meta["sdgs"][1])
+            )
+            result = await call_groq_json(
+                client,
+                config.primary_model,
+                prompt,
+                rate_limiter,
+                max_retries=config.max_retries,
+            )
+        except Exception as e:
+            stats["failed"] += 1
+            async with file_lock:
+                with config.failed_path.open("a", encoding="utf-8") as ff:
+                    ff.write(
+                        json.dumps(
+                            {
+                                "kind": kind,
+                                "key": key,
+                                "error": repr(e),
+                                "meta": meta,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+            return
+
+        meta_out = {**meta, **result}
+        text = meta_out.get("text", "")
+        if not text:
+            stats["empty"] += 1
+            return
+
+        async with file_lock:
+            with config.output_path.open("a", encoding="utf-8") as out_f:
+                out_f.write(json.dumps(meta_out, ensure_ascii=False) + "\n")
+
+        token_count += len(text.split())
+        stats["success"] += 1
+        processed += 1
+
+        if stats["success"] % 100 == 0:
+            elapsed = time.time() - start_time
+            rate = stats["success"] / elapsed * 60.0 if elapsed > 0 else 0.0
+            remaining = remaining_total - processed
+            print(
+                f"\nCheckpoint: {stats['success']} done, "
+                f"{remaining} remaining, "
+                f"{rate:.1f}/min actual rate"
+            )
+
+    tasks = [asyncio.create_task(process_one(kind, meta, key)) for (kind, meta, key) in plan]
+
+    for coro in tqdm(
+        asyncio.as_completed(tasks),
+        total=len(tasks),
+        desc="Generating SDGX",
+        unit="example",
+    ):
+        await coro
+
+    elapsed_total = time.time() - start_time
+    print(
+        f"Done: {stats['success']} success, "
+        f"{stats['failed']} failed, "
+        f"{stats['empty']} empty."
+    )
+    print(
+        f"Total time: {elapsed_total/60.0:.1f} minutes, "
+        f"approx tokens: {token_count}"
+    )
 
 
-def run_generation() -> None:
+def run_generation(test: bool = False) -> None:
     root = Path(__file__).resolve().parents[1]
     config_path = root / "configs" / "config.yaml"
     cfg = load_config(config_path)
-    asyncio.run(generate_all(cfg))
+    asyncio.run(generate_all(cfg, test_mode=test))
 
 
 if __name__ == "__main__":
-    run_generation()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--test", action="store_true")
+    args = parser.parse_args()
+    run_generation(test=args.test)
+
 
