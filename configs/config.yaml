@@ -1,0 +1,42 @@
+groq:
+  primary_model: "llama-3.3-70b-versatile"
+  secondary_model: "mixtral-8x7b-32768"
+  rate_limit_rpm: 30
+  max_retries: 3
+
+generation:
+  easy_per_sdg: 500
+  hard_per_pair: 300
+  sdg14_easy_boost: 700   # extra 200 for SDG 14
+  sdg6_easy_boost: 600    # extra 100 for SDG 6
+  sdg7_easy_boost: 600    # extra 100 for SDG 7
+  min_words: 150
+  max_words: 400
+
+confused_pairs:
+  - [11, 13]  # from data: 190 co-occurrences
+  - [3, 11]   # from data: 178
+  - [11, 17]  # from data: 176
+  - [9, 11]   # from data: 167
+  - [8, 11]   # from data: 156
+  - [4, 10]   # from data: 149
+  - [10, 11]  # from data: 148
+  - [11, 12]  # from data: 143
+  - [8, 9]    # from data: 137
+  - [10, 16]  # from data: 133
+
+training:
+  batch_size: 64
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  patience: 10
+  max_epochs: 100
+  val_split: 0.2
+
+paths:
+  sdgi_train: "data/sdgi_train.parquet"
+  sdgi_test: "data/sdgi_test.parquet"
+  sdgx_validated: "data/sdgx_validated.jsonl"
+  embeddings_cache: "embeddings/cache/"
+  results: "results/"
+
