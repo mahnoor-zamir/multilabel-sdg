@@ -7,3 +7,4 @@ data/validation_report.json
 embeddings/cache/
 results/*.json
 
+.env
