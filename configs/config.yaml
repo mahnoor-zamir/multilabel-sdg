@@ -4,6 +4,11 @@ groq:
   rate_limit_rpm: 30
   max_retries: 1
 
+gemini:
+  model: "gemini-2.0-flash"
+  rate_limit_rpm: 15
+  min_interval: 4.0
+
 generation:
   easy_per_sdg: 18
   hard_per_pair: 56
