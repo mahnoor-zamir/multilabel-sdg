@@ -204,8 +204,9 @@ def main():
     # Contrastive fine-tuning
     model_name = "BAAI/bge-m3"
     contrastive_model = SentenceTransformer(model_name, device=device)
-    contrastive_model.max_seq_length = 512
-    train_dataloader = DataLoader(train_examples, batch_size=32, shuffle=True)
+    # Reduce sequence length and batch size to avoid CUDA OOM on Kaggle GPUs
+    contrastive_model.max_seq_length = 384
+    train_dataloader = DataLoader(train_examples, batch_size=8, shuffle=True)
     train_loss = losses.MultipleNegativesRankingLoss(contrastive_model)
 
     num_epochs = 3
