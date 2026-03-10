@@ -290,7 +290,9 @@ def main():
         mask = (y_test[:, ia] == 1) & (y_test[:, ib] == 1)
         if not mask.any():
             return {"micro_f1": 0.0, "macro_f1": 0.0}
-        m = compute_metrics(y_test[mask][:, [ia, ib]], y_pred[mask][:, [ia, ib]])
+        y_t = y_test[mask][:, [ia, ib]]
+        y_p = y_pred[mask][:, [ia, ib]]
+        m = compute_metrics(y_t, y_p, labels=[0, 1])
         return {"micro_f1": m["micro_f1"], "macro_f1": m["macro_f1"]}
 
     pair_results_sdgi = {p: pair_metrics(p) for p in SDG_WEAK_PAIRS}
