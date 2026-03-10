@@ -1,17 +1,17 @@
 groq:
-  primary_model: "llama-3.3-70b-versatile"
-  secondary_model: "mixtral-8x7b-32768"
+  primary_model: "llama-3.1-8b-instant"
+  secondary_model: "llama-3.3-70b-versatile"
   rate_limit_rpm: 30
-  max_retries: 3
+  max_retries: 1
 
 generation:
-  easy_per_sdg: 500
-  hard_per_pair: 300
-  sdg14_easy_boost: 700   # extra 200 for SDG 14
-  sdg6_easy_boost: 600    # extra 100 for SDG 6
-  sdg7_easy_boost: 600    # extra 100 for SDG 7
+  easy_per_sdg: 18
+  hard_per_pair: 56
+  sdg14_easy_boost: 36
+  sdg6_easy_boost: 28
+  sdg7_easy_boost: 28
   min_words: 150
-  max_words: 400
+  max_words: 350
 
 confused_pairs:
   - [11, 13]  # from data: 190 co-occurrences

@@ -1,9 +1,7 @@
 import argparse
-import asyncio
 import json
 import os
 import time
-from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -281,19 +279,40 @@ def load_existing_indices(path: Path) -> Dict[str, int]:
     return counts
 
 
-async def generate_all(config: GenerationConfig, test_mode: bool = False) -> None:
+def parse_model_json(content: str) -> Dict[str, Any]:
+    """
+    Robust JSON extraction from a Groq response.
+    Tries strict json.loads first (for response_format=json_object),
+    then falls back to decoding the first JSON object found in the text.
+    """
+    content = content.strip()
+    # Fast path: whole content is a single JSON object
+    if content.startswith("{") and content.endswith("}"):
+        return json.loads(content)
+
+    # Fallback: find first '{' and raw_decode from there
+    decoder = json.JSONDecoder()
+    start = content.find("{")
+    if start == -1:
+        raise ValueError("No JSON object found in response")
+    obj, _ = decoder.raw_decode(content[start:])
+    if not isinstance(obj, dict):
+        raise ValueError("Top-level JSON is not an object")
+    return obj
+
+
+def generate_all_sequential(config: GenerationConfig, test_mode: bool = False) -> None:
     api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
         raise RuntimeError("GROQ_API_KEY environment variable must be set.")
 
     client = Groq(api_key=api_key)
-    rate_limiter = RateLimiter(rpm=config.rate_limit_rpm, max_concurrent=10)
 
     existing = load_existing_indices(config.output_path)
     total_target_easy = 0
     total_target_hard = 0
 
-    plan: List[Tuple[str, Dict[str, Any], str]] = []
+    plan: List[Tuple[str, Dict[str, Any], Any]] = []
 
     # Easy examples per SDG
     for sdg in range(1, 18):
@@ -311,7 +330,9 @@ async def generate_all(config: GenerationConfig, test_mode: bool = False) -> Non
         remaining = max(0, target - done)
 
         for _ in range(remaining):
-            plan.append(("easy", {"primary_sdg": sdg, "type": "easy"}, key))
+            plan.append(
+                ("easy", {"primary_sdg": sdg, "type": "easy"}, lambda s=sdg: build_easy_prompt(s))
+            )
 
     # Hard examples for confused pairs
     for n, m in config.confused_pairs:
@@ -325,24 +346,26 @@ async def generate_all(config: GenerationConfig, test_mode: bool = False) -> Non
 
         for _ in range(remaining):
             plan.append(
-                ("hard", {"sdgs": [n, m], "type": "hard", "pair": pair_key}, key)
+                (
+                    "hard",
+                    {"sdgs": [n, m], "type": "hard", "pair": pair_key},
+                    lambda a=n, b=m: build_hard_prompt(a, b),
+                )
             )
 
+    # Test mode: only 5 examples (3 easy SDG1, 2 hard first pair)
     if test_mode:
         plan = []
         for _ in range(3):
-            plan.append(("easy", {"primary_sdg": 1, "type": "easy"}, "easy::1"))
+            plan.append(("easy", {"primary_sdg": 1, "type": "easy"}, lambda: build_easy_prompt(1)))
         if config.confused_pairs:
             n, m = config.confused_pairs[0]
-            pair_key = f"{n}_{m}"
-            for _ in range(2):
-                plan.append(
-                    (
-                        "hard",
-                        {"sdgs": [n, m], "type": "hard", "pair": pair_key},
-                        f"hard::{pair_key}",
-                    )
-                )
+            plan.append(
+                ("hard", {"sdgs": [n, m], "type": "hard", "pair": f"{n}_{m}"}, lambda a=n, b=m: build_hard_prompt(a, b))
+            )
+            plan.append(
+                ("hard", {"sdgs": [n, m], "type": "hard", "pair": f"{n}_{m}"}, lambda a=n, b=m: build_hard_prompt(a, b))
+            )
 
     total_target = total_target_easy + total_target_hard
     already_done = sum(existing.values())
@@ -357,103 +380,103 @@ async def generate_all(config: GenerationConfig, test_mode: bool = False) -> Non
         print("No remaining examples to generate.")
         return
 
-    est_minutes = remaining_total / float(config.rate_limit_rpm)
-    print(
-        f"Generating {remaining_total} examples...\n"
-        f"Est. time at {config.rate_limit_rpm} RPM with 10 concurrent: "
-        f"~{est_minutes:.1f} minutes (ideal, ignoring retries)"
-    )
+    MIN_INTERVAL = 8.0  # seconds between requests
+    print(f"Generating {remaining_total} examples sequentially")
+    print(f"Rate: 1 per {MIN_INTERVAL:.1f}s = {60/MIN_INTERVAL:.0f}/min")
+    est_minutes = remaining_total / (60.0 / MIN_INTERVAL)
+    print(f"Est. time: ~{est_minutes:.1f} minutes")
 
-    file_lock = asyncio.Lock()
-    stats = defaultdict(int)
-    token_count = 0
-    processed = 0
+    stats = {"success": 0, "failed": 0, "empty": 0}
     start_time = time.time()
+    last_request = 0.0
 
-    async def process_one(kind: str, meta: Dict[str, Any], key: str) -> None:
-        nonlocal token_count, processed
-        try:
-            prompt = (
-                build_easy_prompt(meta["primary_sdg"])
-                if kind == "easy"
-                else build_hard_prompt(meta["sdgs"][0], meta["sdgs"][1])
-            )
-            result = await call_groq_json(
-                client,
-                config.primary_model,
-                prompt,
-                rate_limiter,
-                max_retries=config.max_retries,
-            )
-        except Exception as e:
-            stats["failed"] += 1
-            async with file_lock:
-                with config.failed_path.open("a", encoding="utf-8") as ff:
-                    ff.write(
-                        json.dumps(
-                            {
-                                "kind": kind,
-                                "key": key,
-                                "error": repr(e),
-                                "meta": meta,
-                            },
-                            ensure_ascii=False,
-                        )
-                        + "\n"
-                    )
-            return
-
-        meta_out = {**meta, **result}
-        text = meta_out.get("text", "")
-        if not text:
-            stats["empty"] += 1
-            return
-
-        async with file_lock:
-            with config.output_path.open("a", encoding="utf-8") as out_f:
-                out_f.write(json.dumps(meta_out, ensure_ascii=False) + "\n")
-
-        token_count += len(text.split())
-        stats["success"] += 1
-        processed += 1
-
-        if stats["success"] % 100 == 0:
-            elapsed = time.time() - start_time
-            rate = stats["success"] / elapsed * 60.0 if elapsed > 0 else 0.0
-            remaining = remaining_total - processed
-            print(
-                f"\nCheckpoint: {stats['success']} done, "
-                f"{remaining} remaining, "
-                f"{rate:.1f}/min actual rate"
-            )
-
-    tasks = [asyncio.create_task(process_one(kind, meta, key)) for (kind, meta, key) in plan]
-
-    for coro in tqdm(
-        asyncio.as_completed(tasks),
-        total=len(tasks),
-        desc="Generating SDGX",
-        unit="example",
+    for i, (kind, meta, prompt_fn) in enumerate(
+        tqdm(plan, desc="Generating SDGX", unit="example")
     ):
-        await coro
+        elapsed = time.time() - last_request
+        if elapsed < MIN_INTERVAL:
+            time.sleep(MIN_INTERVAL - elapsed)
 
-    elapsed_total = time.time() - start_time
+        prompt = prompt_fn()
+        success = False
+
+        for attempt in range(config.max_retries + 1):
+            try:
+                last_request = time.time()
+                resp = client.chat.completions.create(
+                    model=config.primary_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.8,
+                    max_tokens=800,
+                    # Ask Groq to return pure JSON
+                    response_format={"type": "json_object"},
+                )
+                content = resp.choices[0].message.content or ""
+
+                parsed = parse_model_json(content)
+
+                if not parsed.get("text", "").strip():
+                    stats["empty"] += 1
+                    success = True
+                    break
+
+                meta_out = {**meta, **parsed}
+                with config.output_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(meta_out, ensure_ascii=False) + "\n")
+                stats["success"] += 1
+                success = True
+                break
+
+            except Exception as e:
+                err = str(e).lower()
+                if "rate_limit" in err or "429" in err:
+                    wait = 60 * (attempt + 1)
+                    print(
+                        f"\nRate limited — waiting {wait}s "
+                        f"then slowing to {MIN_INTERVAL*2:.0f}s interval"
+                    )
+                    time.sleep(wait)
+                    MIN_INTERVAL = min(MIN_INTERVAL * 2, 10.0)
+                elif attempt == config.max_retries:
+                    with config.failed_path.open("a", encoding="utf-8") as f:
+                        f.write(
+                            json.dumps({"meta": meta, "error": repr(e)}, ensure_ascii=False)
+                            + "\n"
+                        )
+                    stats["failed"] += 1
+                    success = True
+                    break
+                else:
+                    time.sleep(2**attempt)
+
+        if not success:
+            continue
+
+        if stats["success"] % 50 == 0 and stats["success"] > 0:
+            elapsed_min = (time.time() - start_time) / 60.0
+            rate = stats["success"] / elapsed_min if elapsed_min > 0 else 0.0
+            remaining = len(plan) - i - 1
+            eta = remaining / rate if rate > 0 else 0
+            print(
+                f"\n✓ {stats['success']} done | "
+                f"{rate:.1f}/min actual | "
+                f"~{eta:.0f} min remaining"
+            )
+
+    total_minutes = (time.time() - start_time) / 60.0
     print(
-        f"Done: {stats['success']} success, "
+        f"\nDone: {stats['success']} success, "
         f"{stats['failed']} failed, "
-        f"{stats['empty']} empty."
+        f"{stats['empty']} empty"
     )
-    print(
-        f"Total time: {elapsed_total/60.0:.1f} minutes, "
-        f"approx tokens: {token_count}"
-    )
+    print(f"Total time: {total_minutes:.1f} minutes")
 
 
 def run_generation(test: bool = False) -> None:
     root = Path(__file__).resolve().parents[1]
     config_path = root / "configs" / "config.yaml"
     cfg = load_config(config_path)
-    asyncio.run(generate_all(cfg, test_mode=test))
+    generate_all_sequential(cfg, test_mode=test)
 
 
 if __name__ == "__main__":
@@ -461,5 +484,6 @@ if __name__ == "__main__":
     parser.add_argument("--test", action="store_true")
     args = parser.parse_args()
     run_generation(test=args.test)
+
 
 
