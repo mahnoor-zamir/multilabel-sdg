@@ -140,8 +140,10 @@ def compute_or_load_embeddings(
         y_train = np.concatenate([y_train, sdgx_labels], axis=0)
 
     model = SentenceTransformer(model_name)
-    X_train_emb = model.encode(X_train_texts, batch_size=32, show_progress_bar=True)
-    X_test_emb = model.encode(X_test_texts, batch_size=32, show_progress_bar=True)
+    # Cap sequence length and use small batch size to avoid OOM on GPUs
+    model.max_seq_length = 512
+    X_train_emb = model.encode(X_train_texts, batch_size=8, show_progress_bar=True)
+    X_test_emb = model.encode(X_test_texts, batch_size=8, show_progress_bar=True)
 
     np.savez_compressed(
         train_emb_path,
