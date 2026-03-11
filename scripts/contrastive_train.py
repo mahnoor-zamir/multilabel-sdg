@@ -320,15 +320,25 @@ def main():
     print("Overall SDGX hard-only macro F1:", metrics_hard_all["macro_f1"])
 
     def per_pair_metrics_hard(pair: str) -> Dict[str, float]:
+        """Macro F1 is averaged over only the two SDGs in this pair, not all 17."""
         mask = pairs_hard == pair
         if not mask.any():
             return {"micro_f1": 0.0, "macro_f1": 0.0}
-        m = compute_metrics(labels_hard[mask], y_pred_hard[mask])
+        a_str, b_str = str(pair).split("_")
+        ia, ib = int(a_str) - 1, int(b_str) - 1
+        y_t = labels_hard[mask][:, [ia, ib]]
+        y_p = y_pred_hard[mask][:, [ia, ib]]
+        m = compute_metrics(y_t, y_p, labels=[0, 1])
         return {"micro_f1": m["micro_f1"], "macro_f1": m["macro_f1"]}
 
-    all_pairs = sorted(set(p for p in pairs_hard if p))
+    all_pairs = sorted(set(str(p) for p in pairs_hard if p))
     pair_results_sdgx = {p: per_pair_metrics_hard(p) for p in all_pairs}
-    print("SDGX hard per-pair metrics:", pair_results_sdgx)
+    print("SDGX hard per-pair metrics (macro F1 = avg over the two SDGs in pair only):")
+    print(f"{'Pair':<8} {'Micro F1':>10} {'Macro F1':>10}")
+    print("-" * 30)
+    for p in all_pairs:
+        m = pair_results_sdgx[p]
+        print(f"{p:<8} {m['micro_f1']:>10.3f} {m['macro_f1']:>10.3f}")
 
     # Save everything
     metrics_all = {
